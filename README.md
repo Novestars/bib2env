@@ -17,12 +17,11 @@ This Python script downloads EndNote (`.enw`) files from Google Scholar using a 
     pip install bibtexparser scholarly requests beautifulsoup4
     ```
 2.  **Configure Script:**
-    * Download the `[your_script_name.py]` file (replace `[your_script_name.py]` with your actual script name).
-    * Open it and **set the `BIB_FILE_PATH` variable** to point to your `.bib` file.
-    * You can also change `OUTPUT_DIRECTORY` and `MIN/MAX_DELAY_SECONDS` (at your own risk).
+    * Download the `main.py` file.
+    * Open it and **set the `BIB_FILE_PATH` and `OUTPUT_DIRECTORY` variable** to point to your `.bib` file.
 3.  **Run:**
     ```bash
-    python [your_script_name.py]
+    python main.py
     ```
 
 ## Output
@@ -30,6 +29,3 @@ This Python script downloads EndNote (`.enw`) files from Google Scholar using a 
 * **`.enw` files:** Saved in the `endnote_files` directory (or your configured output folder).
 * **`scholar_download.log`:** A detailed log file. **Check this file to see which references failed and need manual download.**
 
-## License
-
-Consider adding a license (e.g., MIT).
