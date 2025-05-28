@@ -1,0 +1,288 @@
+import bibtexparser
+from scholarly import scholarly, ProxyGenerator  # ProxyGenerator is optional
+import requests
+import os
+import time
+import logging
+import re
+import random
+from bs4 import BeautifulSoup  # Added for HTML parsing
+
+# --- Configuration ---
+BIB_FILE_PATH = 'your_references.bib'  # <--- *** IMPORTANT: SET THIS TO YOUR .BIB FILE PATH ***
+OUTPUT_DIRECTORY = 'endnote_files'  # <--- Folder where .enw files will be saved
+# --- CRITICAL: Long delays are essential to try and avoid blocks/CAPTCHAs ---
+MIN_DELAY_SECONDS = 10  # <--- Minimum seconds to wait between requests
+MAX_DELAY_SECONDS = 20  # <--- Maximum seconds to wait between requests
+# --- END CRITICAL ---
+# USE_PROXIES = False                    # Optional: Set to True to attempt using free proxies (often unreliable)
+
+# --- Logging Setup ---
+# This will create a log file named 'scholar_download.log' in the same directory as the script.
+# It will overwrite the log file each time the script runs (mode='w').
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.FileHandler("scholar_download.log", mode='w'),
+                              logging.StreamHandler()])  # Also print logs to console
+
+
+# --- Functions ---
+
+def setup_scholarly_proxy():
+    """
+    Optional: Sets up a proxy generator for scholarly.
+    Free proxies are generally unreliable and may not help much.
+    """
+    # global USE_PROXIES # If you want to modify this global variable
+    # if not USE_PROXIES:
+    #     logging.info("Proxy usage is disabled.")
+    #     return
+
+    logging.info("Attempting to set up free proxies for scholarly...")
+    try:
+        pg = ProxyGenerator()
+        # pg.Tor_Internal(tor_cmd = "tor") # Example for Tor, requires Tor installed and configured
+        if pg.FreeProxies():  # This method tries to fetch free proxies
+            scholarly.use_proxy(pg)
+            logging.info("Successfully set up free proxies. Note: Free proxies can be unreliable and slow.")
+        else:
+            logging.warning("Failed to set up free proxies. Proceeding without proxies.")
+    except Exception as e:
+        logging.error(f"Error setting up proxies: {e}")
+        logging.warning("Proceeding without proxies.")
+
+
+def sanitize_filename(filename):
+    """Removes or replaces characters that are invalid in filenames."""
+    # Remove characters that are problematic in Windows, Linux, and macOS filenames
+    sanitized = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    # Additionally, remove or replace other potentially problematic characters if needed
+    # For example, control characters:
+    sanitized = re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+    return sanitized[:150]  # Limit filename length to avoid issues
+
+
+def extract_enw_link_from_cite_page_url(cite_page_url, title_for_logging):
+    """
+    Fetches the HTML of the given cite_page_url and parses it to find the EndNote download link.
+    """
+    if not cite_page_url:
+        logging.warning(f"No cite page URL provided for '{title_for_logging[:80]}...'.")
+        return None
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+    }
+    try:
+        logging.info(f"Fetching cite page content from: {cite_page_url[:100]}...")
+        response = requests.get('https://scholar.google.com'+cite_page_url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find the 'EndNote' link. Based on user's HTML, it's an <a> tag with class 'gs_citi'.
+        # We will primarily look for the text "EndNote" within an <a> tag.
+        endnote_link_tag = None
+        for a_tag in soup.find_all('a', class_='gs_citi'):  # Check class first for efficiency
+            if a_tag.get_text(strip=True).lower() == 'endnote':
+                endnote_link_tag = a_tag
+                break
+
+        if not endnote_link_tag:  # Broader search if not found with class
+            for a_tag in soup.find_all('a'):
+                if a_tag.get_text(strip=True).lower() == 'endnote':
+                    endnote_link_tag = a_tag
+                    break
+
+        if endnote_link_tag and endnote_link_tag.has_attr('href'):
+            enw_url = endnote_link_tag['href']
+            # Sometimes the href might be a relative URL, though unlikely for Google Scholar's direct downloads
+            if not enw_url.startswith('http'):
+                # Attempt to construct an absolute URL if needed (this part might need adjustment based on actual relative URLs encountered)
+                from urllib.parse import urljoin
+                enw_url = urljoin(cite_page_url, enw_url)
+            logging.info(f"Found EndNote download link: {enw_url[:100]}...")
+            return enw_url
+        else:
+            logging.warning(
+                f"Could not find 'EndNote' link on the page: {cite_page_url[:100]} for '{title_for_logging[:80]}...'.")
+            logging.debug(
+                f"Page content for {cite_page_url[:100]}:\n{response.text[:500]}")  # Log snippet of page if link not found
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching cite page {cite_page_url[:100]}...: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error parsing cite page {cite_page_url[:100]}...: {e}")
+        return None
+
+
+def get_direct_enw_download_url(title):
+    """
+    Searches Google Scholar, gets 'url_scholarbib', fetches that page,
+    and tries to parse the EndNote download link from it.
+    """
+    try:
+        logging.info(f"Searching Google Scholar for: {title[:80]}...")
+        search_query = scholarly.search_pubs(title)
+        pub = next(search_query)
+        filled_pub = scholarly.fill(pub)
+
+        logging.debug(f"DEBUG - Full data from scholarly for '{title[:60]}...': {filled_pub}")
+
+        # User wants to use 'url_scholarbib' as the source page for the EndNote link
+        cite_page_url_from_scholarbib = filled_pub.get('url_scholarbib')
+
+        if cite_page_url_from_scholarbib:
+            logging.info(f"Using 'url_scholarbib' as cite page URL: {cite_page_url_from_scholarbib[:100]}...")
+            return extract_enw_link_from_cite_page_url(cite_page_url_from_scholarbib, title)
+        else:
+            # Fallback: If 'url_scholarbib' is not present, try to construct a "cite" page URL using an ID
+            # This part reintroduces ID finding, which the user wanted to avoid, but it's a fallback.
+            # If the user strictly wants *only* url_scholarbib, this fallback should be removed.
+            logging.warning(
+                f"'url_scholarbib' not found for '{title[:80]}...'. Attempting fallback to construct cite page URL using an ID.")
+            scholar_id = None
+            if 'id_scholarcitedby' in filled_pub and filled_pub['id_scholarcitedby']:
+                scholar_id = filled_pub['id_scholarcitedby']
+            elif 'cites_id' in filled_pub and filled_pub['cites_id'] and isinstance(filled_pub['cites_id'], list) and \
+                    filled_pub['cites_id']:
+                scholar_id = filled_pub['cites_id'][0]
+
+            if scholar_id:
+                constructed_cite_page_url = f"https://scholar.google.com/scholar?output=cite&hl=en&q=info:{scholar_id}:scholar.google.com/"
+                logging.info(f"Constructed cite page URL using ID: {constructed_cite_page_url[:100]}...")
+                return extract_enw_link_from_cite_page_url(constructed_cite_page_url, title)
+            else:
+                logging.warning(
+                    f"Could not find 'url_scholarbib' nor an ID to construct cite page URL for '{title[:80]}...'.")
+                return None
+
+    except StopIteration:
+        logging.error(f"No results found on Google Scholar for: {title[:80]}...")
+        return None
+    except Exception as e:
+        logging.error(f"CRITICAL ERROR while processing '{title[:80]}...': {e}")
+        if "CAPTCHA" in str(e) or "block" in str(e).lower() or "403" in str(e) or "429" in str(e):
+            logging.warning("CAPTCHA or block detected. Waiting for a longer period.")
+            time.sleep(random.uniform(180, 300))
+        else:
+            time.sleep(random.uniform(60, 120))
+        return None
+
+
+def download_enw_file(direct_enw_url, output_path):  # Changed parameter
+    """Downloads the .enw (EndNote) file from a direct URL."""
+    if not direct_enw_url:  # Changed condition
+        logging.warning("Download attempt skipped: No direct ENW URL provided.")
+        return False
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+    }
+
+    try:
+        logging.info(f"Attempting to download ENW file from direct URL: {direct_enw_url[:100]}...")  # Updated log
+        response = requests.get(direct_enw_url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        if response.text and response.text.strip().startswith('%0'):
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            logging.info(f"Successfully downloaded and saved to {output_path}")
+            return True
+        else:
+            logging.warning(
+                f"Downloaded content from {direct_enw_url[:100]} does not appear to be a valid ENW file. Snippet: {response.text[:150]}...")
+            return False
+
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred while downloading {direct_enw_url[:100]}: {http_err}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error downloading {direct_enw_url[:100]}: {e}")
+    return False
+
+
+def process_bib_file(bib_file_path, output_dir):
+    """
+    Reads a BibTeX file, and for each entry, attempts to find its
+    direct EndNote download link and download the .enw file.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        logging.info(f"Created output directory: {output_dir}")
+
+    try:
+        with open(bib_file_path, 'r', encoding='utf-8') as bibfile:
+            parser = bibtexparser.bparser.BibTexParser(common_strings=True)
+            bib_database = bibtexparser.load(bibfile, parser=parser)
+    except FileNotFoundError:
+        logging.critical(f"FATAL ERROR: The BibTeX file was not found at '{bib_file_path}'")
+        return
+    except Exception as e:
+        logging.critical(f"FATAL ERROR: Could not read or parse BibTeX file: {e}")
+        return
+
+    total_entries = len(bib_database.entries)
+    logging.info(f"Found {total_entries} entries in {bib_file_path}")
+
+    success_count = 0
+    fail_count = 0
+
+    for i, entry in enumerate(bib_database.entries):
+        logging.info(f"--- Processing Entry {i + 1}/{total_entries} ---")
+
+        title = entry.get('title')
+        if title:
+            cleaned_title = title.replace('{', '').replace('}', '')
+            entry_key = entry.get('ID', f"entry_{i + 1}_{random.randint(1000, 9999)}")
+            safe_entry_key = sanitize_filename(entry_key)
+            output_filename = os.path.join(output_dir, f"{safe_entry_key}.enw")
+
+            if os.path.exists(output_filename):
+                logging.info(f"Skipping '{cleaned_title[:50]}...', .enw file already exists.")
+                continue
+
+            direct_enw_url = get_direct_enw_download_url(cleaned_title)  # Call new function
+
+            if direct_enw_url:
+                if download_enw_file(direct_enw_url, output_filename):  # Pass direct URL
+                    success_count += 1
+                else:
+                    fail_count += 1
+            else:
+                logging.warning(f"Failed to get direct ENW download URL for title: {cleaned_title[:50]}...")
+                fail_count += 1
+
+            wait_time = random.uniform(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
+            logging.info(f"Waiting for {wait_time:.1f} seconds before next Google Scholar request...")
+            time.sleep(wait_time)
+        else:
+            logging.warning(f"Skipping entry {entry.get('ID', 'N/A')} because it has no title.")
+            fail_count += 1
+
+    logging.info("--- Processing Finished ---")
+    logging.info(f"Successfully downloaded: {success_count} .enw files.")
+    logging.info(f"Failed or skipped: {fail_count} entries.")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    logging.info("Starting Google Scholar to EndNote Downloader Script...")
+    logging.warning("=" * 70)
+    logging.warning("IMPORTANT: This script scrapes Google Scholar and is highly likely")
+    logging.warning("to be blocked or encounter CAPTCHAs if run too quickly or for")
+    logging.warning("too many entries. Long delays are implemented by default.")
+    logging.warning("Success is NOT guaranteed. Failed entries must be handled manually.")
+    logging.warning("Consider using a VPN and rotating IP addresses if issues persist.")
+    logging.warning("Check 'scholar_download.log' for detailed progress and errors.")
+    logging.warning("=" * 70)
+
+    # setup_scholarly_proxy() # Call this if you want to try using proxies (USE_PROXIES=True)
+    BIB_FILE_PATH = "main.bib"
+    OUTPUT_DIRECTORY = "/Users/hexinzi/Desktop/Code/MFM/test/output"
+    process_bib_file(BIB_FILE_PATH, OUTPUT_DIRECTORY)
+
+    logging.info("Script execution finished.")
+    logging.info(f"Please check the '{OUTPUT_DIRECTORY}' directory for downloaded .enw files.")
+    logging.info("Review 'scholar_download.log' for any errors or skipped entries.")
